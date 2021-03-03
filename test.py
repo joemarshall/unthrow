@@ -36,7 +36,7 @@ def resumeFn(frame,event,arg):
                 unthrow.resumeFrame(resumer.frame,frame,fullTrace[0].frame.f_code)
 
 def exceptionTest():
-    unthrow.stop()
+    unthrow.stop("I'm stopping here")
 
 
 def mainApp():

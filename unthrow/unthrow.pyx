@@ -216,14 +216,14 @@ class ResumableException(Exception):
                     _copyFrameObject(resumeFrame,frame)
 
 # this is a c function so it doesn't get traced into
-def stop():
+def stop(msg):
     global __skip_stop
     if __skip_stop:
         print("RESUMING")
         __skip_stop=False
     else:
         print("STOPPING NOW")
-        rex=ResumableException("BOOM")
+        rex=ResumableException(msg)
         raise rex
 
     
