@@ -18,6 +18,7 @@ def mainApp():
         print("L:",c)
         if c==3 or c==5:
             exceptionTest()
+        print("L2:",c)
     print("END APP")
 
 thisException=None

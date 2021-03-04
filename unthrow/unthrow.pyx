@@ -8,7 +8,7 @@ import collections
 
 import sys,inspect,dis
 
-_SavedFrame=collections.namedtuple("_framestore",['locals_and_stack','lasti', 'code','block_stack'],module=__name__)
+_SavedFrame=collections.namedtuple("_framestore",['locals_and_stack','lasti', 'code','block_stack','locals_map'],module=__name__)
 
 class _PythonNULL(object):
     pass
@@ -16,10 +16,11 @@ class _PythonNULL(object):
 __skip_stop=False
 
 cdef extern from "Python.h":
-
+    cdef int PyCompile_OpcodeStackEffectWithJump(int,int,int)
     cdef char* PyBytes_AsString(PyObject *o)
     cdef PyObject* PyBytes_FromStringAndSize(const char *v, Py_ssize_t len)
     cdef Py_ssize_t PyObject_Length(PyObject *o)
+    cdef PyObject* PyDict_GetItem(PyObject*,PyObject*)
 
 cdef extern from "frameobject.h":
     ctypedef struct PyTryBlock:
@@ -50,20 +51,29 @@ cdef extern from "frameobject.h":
     cdef void PyFrame_FastToLocals(PyFrameObject* frame)
 
 cdef get_stack_pos_after(object code,int target):
+    cdef int no_jump
+    cdef int yes_jump
+    cdef int opcode
+    cdef int arg
     stack_levels={}
     jump_levels={}
     cur_stack=0
     for i in dis.get_instructions(code):
         offset=i.offset
         argval=i.argval
-        arg=i.arg
-        opcode=i.opcode
+        if i.arg:
+            arg=int(i.arg)
+        else:
+            arg=0
+        opcode=int(i.opcode)
         if offset in jump_levels:
             cur_stack=jump_levels[offset]
-        no_jump=dis.stack_effect(opcode,arg,jump=False)        
+        no_jump=PyCompile_OpcodeStackEffectWithJump(opcode,arg,0)
+#dis.stack_effect(opcode,arg,jump=False)        
         if opcode in dis.hasjabs or opcode in dis.hasjrel:
             # a jump - mark the stack level at jump target
-            yes_jump=dis.stack_effect(opcode,arg,jump=True)        
+            yes_jump=PyCompile_OpcodeStackEffectWithJump(opcode,arg,1)
+#            yes_jump=dis.stack_effect(opcode,arg,jump=True)        
             if not argval in jump_levels:
                 jump_levels[argval]=cur_stack+yes_jump
         cur_stack+=no_jump
@@ -73,6 +83,8 @@ cdef get_stack_pos_after(object code,int target):
 
 
 cdef object save_frame(PyFrameObject* source_frame):
+    cdef PyObject *localPtr;
+    PyFrame_FastToLocals(source_frame)
     blockstack=[]
     # last instruction called
     lasti=source_frame.f_lasti
@@ -90,7 +102,10 @@ cdef object save_frame(PyFrameObject* source_frame):
     blockstack=[]
     for c in range(source_frame.f_iblock):
         blockstack.append(source_frame.f_blockstack[c])
-    return _SavedFrame(locals_and_stack=valuestack,code=code_obj,lasti=lasti,block_stack=blockstack)
+    locals_map={}
+    if source_frame.f_locals!=source_frame.f_globals:
+        locals_map=(<object>source_frame).f_locals
+    return _SavedFrame(locals_and_stack=valuestack,code=code_obj,lasti=lasti,block_stack=blockstack,locals_map=locals_map)
 
 cdef void restore_saved_frame(PyFrameObject* target_frame,saved_frame: _SavedFrame):
     # last instruction    
@@ -112,6 +127,9 @@ cdef void restore_saved_frame(PyFrameObject* target_frame,saved_frame: _SavedFra
     for c,x in enumerate(saved_frame.block_stack):
         target_frame.f_blockstack[c]=x
     target_frame.f_iblock=len(saved_frame.block_stack)
+    # restore local symbols
+    target_frame.f_locals=<PyObject*>(saved_frame.locals_map)
+    Py_XINCREF(target_frame.f_locals)
 
 
 class ResumableException(Exception):
@@ -147,7 +165,7 @@ class ResumableException(Exception):
         if len(self.savedFrames)>0:
             resumeFrame=self.savedFrames[-1]
             if frame.f_code.co_code==resumeFrame.code:
-                print("MATCH FRAME:",frame,resumeFrame)
+#                print("MATCH FRAME:",frame,resumeFrame)
                 self.savedFrames=self.savedFrames[:-1]
                 restore_saved_frame(<PyFrameObject*>frame,resumeFrame)
                 if len(self.savedFrames)==0:
@@ -157,10 +175,10 @@ class ResumableException(Exception):
 def stop(msg):
     global __skip_stop
     if __skip_stop:
-        print("RESUMING")
+#        print("RESUMING")
         __skip_stop=False
     else:
-        print("STOPPING NOW")
+#        print("STOPPING NOW")
         rex=ResumableException(msg)
         raise rex
 
