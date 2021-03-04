@@ -40,21 +40,22 @@ def exceptionTest():
 
 
 def mainApp():
-    for c in range(5):
+    for c in range(10):
         print("L:",c)
-        if c==3:
+        if c==3 or c==5:
             exceptionTest()
     print("END APP")
 
 thisException=None
 while True:
+    print("DOING SOMETHING AT TOP LEVEL")
     try:
         if thisException:
             thisException.resume()
         mainApp()
         print("DONE")
         break
-    except unthrow.ResumableException as e:
+    except unthrow.ResumableException as e:        
         thisException=e
 
 
