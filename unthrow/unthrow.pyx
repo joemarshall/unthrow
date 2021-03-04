@@ -1,12 +1,17 @@
 #cython: language_level=3
 from cpython.object cimport PyObject,Py_SIZE
-from cpython.ref cimport Py_XINCREF,Py_XDECREF
+from cpython.ref cimport Py_INCREF,Py_XDECREF,Py_XINCREF
 from libc.string cimport memcpy 
 from cpython cimport array
 import array
-
+import collections
 
 import sys,inspect,dis
+
+_SavedFrame=collections.namedtuple("_framestore",['locals_and_stack','lasti', 'code','block_stack'],module=__name__)
+
+class _PythonNULL(object):
+    pass
 
 __skip_stop=False
 
@@ -18,11 +23,10 @@ cdef extern from "Python.h":
 
 cdef extern from "frameobject.h":
     ctypedef struct PyTryBlock:
-        pass
+        int b_type                
+        int b_handler             
+        int b_level  
 
-
-    cdef enum:
-        CO_MAXBLOCKS
 
     cdef struct _frame:
         PyObject* f_code
@@ -35,7 +39,8 @@ cdef extern from "frameobject.h":
         PyObject **f_stacktop
         PyObject **f_valuestack
         PyObject **f_localsplus
-        PyTryBlock f_blockstack[CO_MAXBLOCKS]
+        PyTryBlock f_blockstack[1] # this is actually sized by a constant, but cython 
+                                   # doesn't redeclare it so we can just put 1 in 
         int f_iblock
 
 
@@ -44,7 +49,7 @@ cdef extern from "frameobject.h":
     cdef PyFrameObject* PyEval_GetFrame()
     cdef void PyFrame_FastToLocals(PyFrameObject* frame)
 
-cdef get_stack_pos_after(object code,int target,logger):
+cdef get_stack_pos_after(object code,int target):
     stack_levels={}
     jump_levels={}
     cur_stack=0
@@ -63,128 +68,73 @@ cdef get_stack_pos_after(object code,int target,logger):
                 jump_levels[argval]=cur_stack+yes_jump
         cur_stack+=no_jump
         stack_levels[offset]=cur_stack
-        logger(offset,i.opname,argval,cur_stack)
+      #  print(offset,i.opname,argval,cur_stack)
     return stack_levels[target]
 
-def _copy_frame_object(source_frame,target_frame=None,logger=lambda *x:None,inc_references=True):
-    cdef PyFrameObject* source_frame_addr=<PyFrameObject*>source_frame
-    cdef PyFrameObject* target_frame_addr=NULL
-    cdef array.array ra;
-    if inspect.isframe(source_frame):        
-        source_frame_addr=<PyFrameObject*>source_frame
-        PyFrame_FastToLocals(source_frame_addr)
-    else:
-        ra=source_frame
-        source_frame_addr=<PyFrameObject*>ra.data.as_chars
-    if target_frame!=None:
-        target_frame_addr=<PyFrameObject*>target_frame
 
-    ret_array=None
-    # copy value, block stacks and locals / globals etc. from a frame
-    # which is live (i.e. not after exception has been thrown, which 
-    # kills stacks and frees things) into a new frame object which has stack set correctly etc.
-    
-    # find current stack size of stack at this point
-    # n.b. we can't rely on the stack to be in the frame object
-    # because it is kept in a local variable in evaluation loop
-    logger((<object>source_frame_addr[0].f_code))
-    max_stacksize=(<object>source_frame_addr[0].f_code).co_stacksize
-
-    # if no target frame passed, make a placeholder buffer to hold the 
-    # values that are in the frame - this is not really a frame in python
-    # just holds the references we need to keep for us
-    cdef array.array byte_array_template = array.array('b', [0])
-    if target_frame_addr==NULL:                
-        frame_size=(Py_SIZE(<object>source_frame_addr)-1)*sizeof(PyObject*) + sizeof(PyFrameObject)
-        ra=array.clone(byte_array_template,frame_size,zero=True)
-        ret_array=ra
-        target_frame_addr=<PyFrameObject*>ra.data.as_chars
-        target_frame_addr[0].f_code=source_frame_addr[0].f_code
-        if inc_references:
-            Py_XINCREF(target_frame_addr[0].f_code)
-        logger("SAVING FRAME:",<object>target_frame_addr[0].f_code)
-
-    target_frame_addr[0].f_lasti=source_frame_addr[0].f_lasti
-
-    max_stacksize=(<object>target_frame_addr[0].f_code).co_stacksize
-    our_stacksize=get_stack_pos_after(<object>source_frame_addr[0].f_code,target_frame_addr[0].f_lasti-2,logger)
-    logger("stackSize:",our_stacksize,target_frame_addr[0].f_lasti)
-
-    # copy value stack and local objects themselves across
-    # incrementing references on anything that needs incrementing
-
-    if  <int>source_frame_addr[0].f_locals==0 or  source_frame_addr[0].f_locals== source_frame_addr[0].f_globals:
-        new_locals_len=0
-    else:
-        new_locals_len=len(<object>(source_frame_addr[0].f_locals) )#<object>(source_frame_addr[0].f_locals));
-    old_locals_len=0
-    if target_frame!=None:
-        old_locals_len=len(target_frame.f_locals)
-    logger("NL:",new_locals_len,"OL:",old_locals_len)
-    for c in range(our_stacksize + new_locals_len ):
-        if c<old_locals_len: 
-            #unref old locals (we know we're always at the start of a method so no old stack)
-            Py_XDECREF((target_frame_addr[0].f_localsplus[c]))
-        target_frame_addr[0].f_localsplus[c]=source_frame_addr[0].f_localsplus[c]
-        if inc_references:
-            Py_XINCREF((target_frame_addr[0].f_localsplus[c]))
-        if <int>target_frame_addr[0].f_localsplus[c]!=0:
-            logger("STACK+LOCALS:",c,"=",<object>target_frame_addr[0].f_localsplus[c])
+cdef object save_frame(PyFrameObject* source_frame):
+    blockstack=[]
+    # last instruction called
+    lasti=source_frame.f_lasti
+    # get our value stack size from the code instructions
+    our_stacksize=get_stack_pos_after(<object>source_frame.f_code,lasti-2)
+    our_localsize=<int>(source_frame.f_valuestack-source_frame.f_localsplus);
+    code_obj=(<object>source_frame).f_code.co_code    
+    # grab everything off the locals and value stack
+    valuestack=[]
+    for c in range(our_stacksize+our_localsize):
+        if <int>source_frame.f_localsplus[c] ==0:
+            valuestack.append(_PythonNULL())
         else:
-            logger("STACK+LOCALS:",c,"= NULL")
-    # update stack top and size
-    target_frame_addr[0].f_valuestack=&target_frame_addr[0].f_localsplus[new_locals_len]
-    target_frame_addr[0].f_stacktop=&target_frame_addr[0].f_valuestack[our_stacksize]
-    
+            valuestack.append(<object>source_frame.f_localsplus[c])
+    blockstack=[]
+    for c in range(source_frame.f_iblock):
+        blockstack.append(source_frame.f_blockstack[c])
+    return _SavedFrame(locals_and_stack=valuestack,code=code_obj,lasti=lasti,block_stack=blockstack)
 
-    # copy local symbol table
-    _copytable(&(target_frame_addr[0].f_locals),&(source_frame_addr[0].f_locals),increfs=inc_references,decrefs=not inc_references)
+cdef void restore_saved_frame(PyFrameObject* target_frame,saved_frame: _SavedFrame):
+    # last instruction    
+    target_frame.f_lasti=saved_frame.lasti
+    # check code is the same
+    if (<object>target_frame).f_code.co_code!=saved_frame.code:
+        print("Trying to restore wrong frame")
+        return
+    # restore locals and stack
+    for c,x in enumerate(saved_frame.locals_and_stack):
+        if type(x)==_PythonNULL:
+            target_frame.f_localsplus[c]=NULL
+        else:
+            target_frame.f_localsplus[c]=<PyObject*>x
+            Py_INCREF(x)
+    target_frame.f_stacktop=&target_frame.f_localsplus[len(saved_frame.locals_and_stack)]
 
-    # copy global symbol table
-    _copytable(&(target_frame_addr[0].f_globals),&(source_frame_addr[0].f_globals),increfs=inc_references,decrefs=not inc_references)
+    # restore block stack
+    for c,x in enumerate(saved_frame.block_stack):
+        target_frame.f_blockstack[c]=x
+    target_frame.f_iblock=len(saved_frame.block_stack)
 
-    # copy builtins
-    _copytable(&(target_frame_addr[0].f_builtins),&(source_frame_addr[0].f_builtins),increfs=inc_references,decrefs=not inc_references)
-    
-    # copy the block stack
-    target_frame_addr[0].f_iblock=source_frame_addr[0].f_iblock
-    memcpy(target_frame_addr[0].f_blockstack,source_frame_addr[0].f_blockstack,sizeof(PyTryBlock)*CO_MAXBLOCKS);
-    return ret_array        
-
-
-# copy a table and correctly inc and dec the references
-# nb. we use the temp just in case they are pointers to the same object
-# which we don't want to unref too much
-cdef void _copytable(PyObject **destTable,PyObject **fromTable,decrefs=False,increfs=False):
-    cdef PyObject* temp
-    temp = destTable[0]
-    destTable[0]=fromTable[0]
-    if increfs:
-        Py_XINCREF((destTable[0]))
-    if decrefs:
-        Py_XDECREF(temp)
 
 class ResumableException(Exception):
-    def __init__(self,message):
-        Exception.__init__(self,message)
+    def __init__(self,parameter):
+        Exception.__init__(self,str(parameter))
         # store locals and stack for all the things, while we're still in a call, before exception is thrown 
         # and calling stack objects are dereferenced
         self._save_stack()
+        self.parameter=parameter
+
 
     def _save_stack(self):
         self.savedFrames=[]
         st=inspect.stack()
         for frameinfo in st:
-            self.savedFrames.append((frameinfo.frame.f_code,_copy_frame_object(frameinfo.frame,inc_references=True)))
-#        print(self.savedFrames)
-
+            self.savedFrames.append(save_frame(<PyFrameObject*>(frameinfo.frame)))
 
     def resume(self):
         global __skip_stop
         __skip_stop=True
         st=inspect.stack()
         for frameinfo in reversed(st):
-            if self.savedFrames[-1][0]==frameinfo.frame.f_code:
+            if self.savedFrames[-1].code==frameinfo.frame.f_code.co_code:
                 self.savedFrames=self.savedFrames[:-1]
         sys.settrace(self._calltrace)
 
@@ -195,16 +145,13 @@ class ResumableException(Exception):
 
     def _resumefn(self,frame,event,arg):
         if len(self.savedFrames)>0:
-            resumeCode,resumeFrame=self.savedFrames[-1]
-#            print(resumeCode,frame)
-            if frame.f_code==resumeCode:
-                #print("MATCH FRAME:",frame,resumeCode)
+            resumeFrame=self.savedFrames[-1]
+            if frame.f_code.co_code==resumeFrame.code:
+                print("MATCH FRAME:",frame,resumeFrame)
                 self.savedFrames=self.savedFrames[:-1]
+                restore_saved_frame(<PyFrameObject*>frame,resumeFrame)
                 if len(self.savedFrames)==0:
-                    _copy_frame_object(resumeFrame,frame,inc_references=False)
                     sys.settrace(None)
-                else:
-                    _copy_frame_object(resumeFrame,frame,inc_references=False)
 
 # this is a c function so it doesn't get traced into
 def stop(msg):
