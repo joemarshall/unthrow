@@ -1,0 +1,139 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8">
+    <script src="https://cdn.jsdelivr.net/npm/jquery"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jquery.terminal/js/jquery.terminal.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jquery.terminal/js/echo_newline.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/jquery.terminal/css/jquery.terminal.min.css" rel="stylesheet"/>
+    <style>
+      .terminal { --size: 1.5; }
+    </style>
+  </head>
+  <body>
+    <script>
+    let term;
+    let lastMessage=1;
+    const pyodideWorker = new Worker('./async_worker.js')
+    let responseWaiter={};
+
+    async function onRemoteMessage(event)
+    {   
+        console.log("REMOTE:",event,event.data)
+        let msgData=event.data;
+        if(msgData["type"]=="stdout")
+        {
+            let lines=msgData["text"].split("\n")
+            while(lines.length>0)
+            {
+                var txt=lines.shift();
+                term.echo(txt, {newline : lines.length>0?true:false})
+            }
+        }else if(msgData["type"]=="stderr")
+        {
+            let lines=msgData["text"].split("\n")
+            while(lines.length>0)
+            {
+                var txt=lines.shift();
+                term.error(txt, {newline : lines.length>0?true:false})
+            }
+        }else if(msgData["type"]=="response")
+        {
+            let msgID=msgData["id"];
+            if(responseWaiter[msgID])
+            {
+                console.log("Responded1",msgData);
+                let p=responseWaiter[msgID];
+                p(msgData);
+                responseWaiter[msgID]=undefined;
+            }
+        }
+    }
+
+    function onRemoteError(event)
+    {
+        term.error(event.data);
+        console.log(event)
+    }
+
+    pyodideWorker.onmessage = onRemoteMessage;
+    pyodideWorker.onerror = onRemoteError;
+    async function asyncRun(cmd,arg){
+        lastMessage++;
+        let p=new Promise((r,e)=>{responseWaiter[lastMessage]=(r)});
+        pyodideWorker.postMessage({
+            cmd: cmd,
+            arg: arg,
+            id: lastMessage
+        });
+        try
+        {
+            var responseData=await p;
+            console.log("Responded",responseData)
+            return responseData;
+        }catch(e)
+        {
+            console.log("Error in asyncRun:",e);
+        }
+    }
+
+    async function initPython()
+    {
+        await asyncRun("init");
+        console.log("Inited")
+    }
+    let ps1 = '>>> ', ps2 = '... ';
+
+//// TODO - make the interpreter send messages to the webworker
+//// and receive console output back
+
+    async function interpreter(command) {
+        // multiline should be splitted (usefull when pasting)
+        term.pause();
+        let prompt=ps1;
+        for( const c of command.split('\n') ) {
+            res=await asyncRun("push_and_run",c)
+            prompt = res.needsMore ? ps2 : ps1;
+        }
+        term.resume();
+        term.set_prompt(prompt);
+    }
+    initPython().then(async ()=>{
+        var banner=(await asyncRun("banner")).results;        
+        term = $('body').terminal(
+          interpreter,
+          {
+            greetings: banner,
+            prompt: ps1,
+            completionEscape: false,
+            pauseEvents:false,
+            completion: function(command, callback) 
+            {
+                asyncRun("tab_complete",command).then(
+                    (response)=>{callback(response.toJs()[0]);} 
+                );
+            },
+            keydown: function(evt){
+                var ctrlDown = evt.ctrlKey||evt.metaKey;
+                if (ctrlDown && evt.altKey) 
+                {
+                    return;
+                }
+                if (evt.keyCode==67 && ctrlDown)
+                {
+                    asyncRun("abort","ctrlc").then(()=>{
+                        term.resume();
+                        term.set_prompt(ps1);});
+                    return false;
+                }
+                return;
+            }
+
+
+          }
+        );
+    }
+  );
+    </script>
+  </body>
+</html>

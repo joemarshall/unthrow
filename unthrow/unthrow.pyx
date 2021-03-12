@@ -32,13 +32,14 @@ class Resumer:
         # start interrupts if freq != 0
         set_interrupt_frequency(self.freq)
         try:
-            mainfn(args)
+            mainfn(*args)
         except ResumableException as re:
             self.resume_params=re.parameter
             self.resume_stack=re.saved_frames
             re.with_traceback(None)
-            self.finished=False            
-            
+            self.finished=False
+        finally:
+            interrupts_enabled=0
         # stop interrupts
         global interrupts_enabled
         set_interrupt_frequency(0)
