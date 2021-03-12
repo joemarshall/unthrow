@@ -10,6 +10,48 @@ import sys,inspect,dis
 
 traceall=False
 
+class Resumer:
+    def __init__(self):
+        self.finished=False
+        self.resume_params=None
+        self.resume_stack=None
+        self.freq=0
+        self.running=0
+
+    def run_once(self,mainfn,args):
+        global interrupts_enabled
+        if self.resume_stack:
+            _do_resume(<PyObject*>self.resume_stack)
+            self.resume_stack=None
+        self.running=1
+        interrupts_enabled=1
+        interrupt_call_level=-1 
+        # we call into the first level where interrupts should be
+        interrupt_with_block_initial_level=PyEval_GetFrame().f_iblock+1
+        self.finished=True
+        # start interrupts if freq != 0
+        set_interrupt_frequency(self.freq)
+        try:
+            mainfn(args)
+        except ResumableException as re:
+            self.resume_params=re.parameter
+            self.resume_stack=re.saved_frames
+            re.with_traceback(None)
+            self.finished=False            
+            
+        # stop interrupts
+        global interrupts_enabled
+        set_interrupt_frequency(0)
+        self.running=0
+        interrupts_enabled=0
+        return self.finished
+
+    def set_interrupt_frequency(self,freq):
+        self.freq=freq
+        if self.running:
+            set_interrupt_frequency(self.freq)
+            
+
 # like a named tuple but mutable (so that we can zero things to avoid leaks)
 class _SavedFrame:
     def __init__(self,*,locals_and_stack,lasti,code,block_stack,globals_if_different):
@@ -52,7 +94,7 @@ cdef extern from "frameobject.h":
 
     cdef struct _frame:
         _frame * f_back
-        PyObject* f_code
+        PyCodeObject* f_code
         int f_lasti
         char f_executing
         PyObject *f_locals
@@ -79,10 +121,13 @@ cdef extern from "frameobject.h":
 cdef extern from "opcode.h":
     cdef enum _opcodes:
         SETUP_FINALLY
+        BEGIN_FINALLY
 
 cdef extern from "Python.h":
     ctypedef struct PyCodeObject:
         PyObject* co_code
+        PyObject* co_name
+        
     cdef PyObject* Py_True
     ctypedef int (*Py_tracefunc)(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg)
     cdef enum _trace_types:
@@ -182,8 +227,10 @@ cdef object save_frame(PyFrameObject* source_frame,from_interrupt):
         # in an interrupt top level frame, the function is at the start of an instruction
         # and the next instruction is about to run
         lasti-=2
-        our_stacksize=get_stack_pos_before(<object>source_frame.f_code,lasti+2)
-
+        if source_frame.f_stacktop!=NULL:
+            our_stacksize=source_frame.f_stacktop - source_frame.f_valuestack
+        else:
+            our_stacksize=get_stack_pos_before(<object>source_frame.f_code,lasti+2)
     else:
         # anywhere else, the frame is half way through a call and lasti points
         # at just the call. But we still have the call args pushed on stack, 
@@ -284,27 +331,28 @@ cdef int interrupts_enabled=1
 cdef int interrupt_counter=0
 cdef int interrupt_frequency=0 # every N instructions call out to JS
 cdef int in_resume=0
+cdef int interrupt_with_block_initial_level=0 
 cdef int interrupt_call_level=0
 cdef int interrupt_with_level=-1
 
-cdef void set_resume(PyObject* obj,int is_resuming):
-    global in_resume,resume_state,interrupt_frequency
+cdef void set_resume(int is_resuming):
+    global in_resume,resume_state,interrupt_frequency,_trace_obj
     resume_state=0
     in_resume=is_resuming
     if in_resume==0 and interrupt_frequency==0:
         PyEval_SetTrace(NULL,NULL)
     else:
-        PyEval_SetTrace(&_c_trace_fn,obj)
+        PyEval_SetTrace(&_c_trace_fn,NULL)
 
-cdef void set_interrupt_frequency(PyObject* obj,int freq):
-    global in_resume,resume_state,interrupt_frequency,interrupt_counter
+cdef void set_interrupt_frequency(int freq):
+    global in_resume,resume_state,interrupt_frequency,interrupt_counter,_trace_obj
     if interrupt_frequency!=freq:
         interrupt_counter=0
         interrupt_frequency=freq
         if in_resume==0 and interrupt_frequency==0:
             PyEval_SetTrace(NULL,NULL)
         else:
-            PyEval_SetTrace(&_c_trace_fn,obj)
+            PyEval_SetTrace(&_c_trace_fn,NULL)
 
 cdef int _c_trace_fn(PyObject *self, PyFrameObject *frame,
                  int what, PyObject *arg):
@@ -312,38 +360,50 @@ cdef int _c_trace_fn(PyObject *self, PyFrameObject *frame,
     if in_resume:
         # in resume call, ignore interrupts
         if what==PyTrace_CALL:
-            (<object>self)._resumefn(<object>frame)
+            _resume_frame(_resume_list,frame)
     elif interrupts_enabled==1:
         if what==PyTrace_CALL:
+            # check if this call is enter or exit of a with
+            if <object>(frame.f_code.co_name)=="__enter__" or <object>(frame.f_code.co_name)=="__exit__":
+                interrupt_with_level=interrupt_call_level
             interrupt_call_level+=1
         if what==PyTrace_RETURN:
             interrupt_call_level-=1
             if interrupt_call_level<0:
                 # outside the scope where we were called, stop tracing now
-                set_interrupt_frequency(<PyObject*>_trace_obj,0)
+                set_interrupt_frequency(0)
         if interrupt_frequency!=0 and what==PyTrace_LINE:
-            # on a line
-            # check if we are have a finally block at this level (either a with block or a try,except,finally
-            # we can't resume within those or bad things will happen
-            if interrupt_with_level==-1 or interrupt_with_level>=interrupt_call_level:
-                interrupt_with_level=-1
-                for c in range(frame.f_iblock):
-                    if (frame.f_blockstack[c].b_type)==SETUP_FINALLY: # with block is basically try, finally
-                        interrupt_with_level=interrupt_call_level                
             interrupt_counter+=1
-            interrupts_enabled=0 
             # only throw interrupt if we are not inside a with block, 
             # as we can't restore context managers (files etc)
-            if interrupt_counter>=interrupt_frequency and interrupt_with_level==-1:
-                # throw interrupt exception
-                interrupt_counter=0
-                make_interrupt(<void*>self,frame)
-                return 1 # need to return 1 to signal error or else our exception 
-                         # gets cleaned up by cpython
-            else:
-                interrupts_enabled=1
-#    if traceall and what==PyTrace_CALL:
-#        print("Making call",interrupt_call_level)
+            if interrupt_counter>=interrupt_frequency:
+                # check if we are have a finally block at this level (either a with block or a try,except,finally
+                # we can't resume within those or bad things will happen
+                if interrupt_with_level==-1 or interrupt_with_level>=interrupt_call_level:
+                    interrupt_with_level=-1
+                    for c in range(frame.f_iblock):
+                        # we expect to be inside our own with block at level zero
+                        if interrupt_call_level==0 and c<=interrupt_with_block_initial_level:
+                            continue
+                        if (frame.f_blockstack[c].b_type)==SETUP_FINALLY: # with block is basically try, finally
+                            # SETUP_FINALLY also sets up exception catches, an actual finally block
+                            # is a SETUP_FINALLY that points to POP_BLOCK, BEGIN_FINALLY
+                            # we only care about exception blocks that would be called when our exception 
+                            # comes out. nb. catch-all exception blocks will also get called
+                            frameCode=PyBytes_AsString(frame.f_code.co_code)
+                            if frameCode[frame.f_blockstack[c].b_handler-2]==BEGIN_FINALLY:
+                               # there is a finally block
+                               interrupt_with_level=interrupt_call_level
+
+                interrupts_enabled=0 
+                if interrupt_with_level==-1:
+                    # throw interrupt exception
+                    interrupt_counter=0
+                    make_interrupt(<void*>self,frame)
+                    return 1 # need to return 1 to signal error or else our exception 
+                             # gets cleaned up by cpython
+                else:
+                    interrupts_enabled=1
     return 0
 
 cdef make_interrupt(void* arg,PyFrameObject*frame):    
@@ -367,14 +427,14 @@ cdef PyObject* make_resumable_exception(PyObject* msg,PyFrameObject* frame):
     cdef PyObject* exc=PyObject_Call(ResumableExceptionClass,PyTuple_New(0),NULL)
     (<object>exc).parameter=<object>msg;
     (<object>exc).saved_frames=[]
-    save_stack((<object>exc).saved_frames,frame)
+    _save_stack((<object>exc).saved_frames,frame)
     return exc
 
     
 
 # store locals and stack for all the things, while we're still in a call, before exception is thrown 
 # and calling stack objects are dereferenced etc.
-cdef save_stack(object saved_frames,PyFrameObject* cFrame):
+cdef _save_stack(object saved_frames,PyFrameObject* cFrame):
     from_interrupt=False
     if cFrame==NULL:
         cFrame=PyEval_GetFrame()
@@ -385,23 +445,25 @@ cdef save_stack(object saved_frames,PyFrameObject* cFrame):
         from_interrupt=False # only the top frame of an interrupt is different
         cFrame=cFrame.f_back
 
-cpdef void resume(object saved_frames):
-    global __skip_stop
+cdef void _do_resume(PyObject* c_saved_frames):
+    global __skip_stop,_resume_list
+    Py_XINCREF(c_saved_frames)
+    saved_frames=<object>c_saved_frames
     cdef PyFrameObject* cFrame;
     cFrame=PyEval_GetFrame()
     allStack=[]
     while cFrame!=NULL:
         allStack.append(<object>cFrame)
         cFrame=cFrame.f_back
-    for frame in reversed(allStack):
+    for frame in reversed(allStack):        
         if saved_frames[-1].code==frame.f_code.co_code:
-            #print("REMOVING",frame.f_code.co_code,self.saved_frames[-1])
             saved_frames.pop()
     allStack=[]
-    _trace_obj.set_resume_obj(saved_frames)
-    set_resume(<PyObject*>_trace_obj,1)
+    Py_XINCREF(c_saved_frames)
+    _resume_list=c_saved_frames
+    set_resume(1)
 
-cdef void _resume(PyObject* c_saved_frames,PyFrameObject* c_frame):
+cdef void _resume_frame(PyObject* c_saved_frames,PyFrameObject* c_frame):
     global interrupts_enabled
     frame=<object>c_frame
     saved_frames=<object>c_saved_frames
@@ -409,11 +471,11 @@ cdef void _resume(PyObject* c_saved_frames,PyFrameObject* c_frame):
         resumeFrame=saved_frames[-1]
         if frame.f_code.co_code==resumeFrame.code:
             saved_frames.pop()
-            #print("MATCH FRAME:",frame,resumeFrame)
+#            print("MATCH FRAME:",frame,resumeFrame)
             restore_saved_frame(c_frame,resumeFrame)
             if len(saved_frames)==0:
-                set_resume(<PyObject*>_trace_obj,0)
-                _trace_obj.set_resume_obj(None)
+                set_resume(0)
+                _resume_list=NULL;
                 interrupts_enabled=1
 
 # this is a c function so it doesn't get traced into
@@ -433,23 +495,6 @@ def stop(msg):
         Py_XDECREF(rex)
         raise objRex
 
-def set_interrupts(freq):
-    # get the interrupt top frame, we only throw interrupts below here
-    # otherwise weird stuff happens with things like stdout
-    set_interrupt_frequency(<PyObject*>_trace_obj,freq)
-    interrupt_call_level=0
-
-
-class _Tracer:
-    def __init__(self):
-        self.resumeObj=None
-
-    def set_resume_obj(self,obj):
-        self.resumeObj=obj
-
-    def _resumefn(self,frame): 
-        _resume(<PyObject*>self.resumeObj,<PyFrameObject*>frame)
-
-_trace_obj=_Tracer()
+cdef PyObject* _resume_list=NULL
 
 

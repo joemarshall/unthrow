@@ -1,9 +1,11 @@
 import unthrow
 import inspect
+import dis
 import traceback
 import sys
 import gc
 import testmod
+
 
 fullTrace=[]
 
@@ -20,8 +22,7 @@ def exceptionTest():
 
 def mainApp(x):
 #    import testmod
-    unthrow.set_interrupts(50)
-    unthrow.traceall=True
+#    unthrow.traceall=True
     print("RUN IN TEST MODULE")
     testmod.runtest()
     print("RUN IN EXEC")
@@ -53,27 +54,40 @@ def mainApp(x):
     with context_blocker() as b:
         for c in range(100):
             print(".",end="")
+    print("RUN BLOCKED BY TRY, finally")
+    try:
+        for c in range(100):
+            print("*",end="")
+        print("Loop done")
+    except ValueError as v:
+        pass
+    finally:
+        for c in range(10):
+            print("F",end="")
+    print("RUN with another exception catch but no finally")
+    try:
+        for c in range(100):
+            print("*",end="")
+        print("Loop done")
+    except ValueError as v:
+        pass
+
     print("END APP")
 
 resume_info=None
 x=["woo"]
-while True:
-    print("DOING SOMETHING AT TOP LEVEL")
-    try:
-        if resume_info:
-            unthrow.resume(resume_info)
-            resume_info=None
-        mainApp(x)
-        print("DONE")
-        break
-    except unthrow.ResumableException as e:
-        resume_info=e.saved_frames
-        #print("Top level:",e.parameter)
-print("Doing something outside")
+r=unthrow.Resumer()
+r.set_interrupt_frequency(2)
+while r.finished==False:
+    print("TP",end="")
+    r.run_once(mainApp,x)
+print("Doing something outside everything")
 for c in range(100):
     print(".",end="")
 resume_info=None
-print("RC X3:",sys.getrefcount(x))
+#print(dis.dis(mainApp))
+
+print("RC X3 should be 2, otherwise ref leak:",sys.getrefcount(x))
 
 
 
