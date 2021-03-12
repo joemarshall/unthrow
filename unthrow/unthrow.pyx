@@ -1,6 +1,6 @@
 #cython: language_level=3
 from cpython.object cimport PyObject,Py_SIZE
-from cpython.ref cimport Py_INCREF,Py_XDECREF,Py_XINCREF
+from cpython.ref cimport Py_INCREF,Py_XDECREF,Py_XINCREF,Py_CLEAR
 from libc.string cimport memcpy 
 from cpython cimport array
 import array
@@ -8,19 +8,40 @@ import collections
 
 import sys,inspect,dis
 
-_SavedFrame=collections.namedtuple("_framestore",['locals_and_stack','lasti', 'code','block_stack','locals_map'],module=__name__)
+traceall=False
+
+# like a named tuple but mutable (so that we can zero things to avoid leaks)
+class _SavedFrame:
+    def __init__(self,*,locals_and_stack,lasti,code,block_stack,globals_if_different):
+        dict=locals().copy() # put all the parameters to this into the dict
+        del dict["self"]
+        self._dictionary=dict
+
+    def __getattr__(self,attr):
+        if attr!="_dictionary" and attr in self._dictionary:    
+            return self._dictionary[attr]
+        else:
+            super().__getattribute__(attr)
+        
+    def __setattr__(self,attr,value):
+        if attr!="_dictionary" and attr in self._dictionary:    
+            self._dictionary[attr]=value
+        else:
+            super().__setattr__(attr,value)
+
+    def __repr__(self):
+        return str(self._dictionary)
 
 class _PythonNULL(object):
     pass
 
-__skip_stop=False
+def test_iter(maxVal):
+    for c in range(maxVal):
+        print("TI:",c)
+        yield c
 
-cdef extern from "Python.h":
-    cdef int PyCompile_OpcodeStackEffectWithJump(int,int,int)
-    cdef char* PyBytes_AsString(PyObject *o)
-    cdef PyObject* PyBytes_FromStringAndSize(const char *v, Py_ssize_t len)
-    cdef Py_ssize_t PyObject_Length(PyObject *o)
-    cdef PyObject* PyDict_GetItem(PyObject*,PyObject*)
+
+cdef int  __skip_stop=False
 
 cdef extern from "frameobject.h":
     ctypedef struct PyTryBlock:
@@ -30,6 +51,7 @@ cdef extern from "frameobject.h":
 
 
     cdef struct _frame:
+        _frame * f_back
         PyObject* f_code
         int f_lasti
         char f_executing
@@ -43,14 +65,73 @@ cdef extern from "frameobject.h":
         PyTryBlock f_blockstack[1] # this is actually sized by a constant, but cython 
                                    # doesn't redeclare it so we can just put 1 in 
         int f_iblock
+        int f_trace_opcodes;
 
 
     ctypedef _frame PyFrameObject
 
     cdef PyFrameObject* PyEval_GetFrame()
     cdef void PyFrame_FastToLocals(PyFrameObject* frame)
+    cdef void PyFrame_LocalsToFast(PyFrameObject* frame,int clear)
+    cdef PyObject* PyObject_Call(PyObject*obj,PyObject*args,PyObject*kwArgs)
 
-cdef get_stack_pos_after(object code,int target):
+
+cdef extern from "opcode.h":
+    cdef enum _opcodes:
+        SETUP_FINALLY
+
+cdef extern from "Python.h":
+    ctypedef struct PyCodeObject:
+        PyObject* co_code
+    cdef PyObject* Py_True
+    ctypedef int (*Py_tracefunc)(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg)
+    cdef enum _trace_types:
+        PyTrace_LINE
+        PyTrace_CALL
+        PyTrace_OPCODE
+        PyTrace_RETURN
+
+    cdef int PyCompile_OpcodeStackEffectWithJump(int,int,int)
+    cdef char* PyBytes_AsString(PyObject *o)
+    cdef PyObject* PyBytes_FromStringAndSize(const char *v, Py_ssize_t len)
+    cdef Py_ssize_t PyObject_Length(PyObject *o)
+    cdef PyObject* PyDict_GetItem(PyObject*,PyObject*)
+    cdef int PyDict_SetItemString(PyObject*dict,const char*key,PyObject* val)
+    cdef int PyDict_SetItem(PyObject*dict,PyObject*key,PyObject* val)
+    cdef int PyDict_Next(PyObject *p, Py_ssize_t *ppos, PyObject **pkey, PyObject **pvalue)
+
+    cdef int PyCode_Check(PyObject*)
+
+    cdef int PyEval_SetTrace(Py_tracefunc fn,PyObject*self)
+    cdef int Py_AddPendingCall(int (*fn)(void*),void*arg)
+    cdef void PyErr_SetObject(PyObject*type,PyObject*val)
+    cdef PyObject* PyUnicode_FromString(char*str);
+    cdef PyObject* PyExc_ValueError
+
+    cdef PyObject* PyDict_New()
+
+    cdef void PyErr_SetString(PyObject*,char *)
+    cdef PyObject* PyErr_NewException(const char *name, PyObject *base, PyObject *dict)
+    cdef PyObject* PyErr_Occurred()
+    cdef PyObject* PyTuple_New(Py_ssize_t size)
+
+    cdef int Py_REFCNT(PyObject* ob)
+
+    cdef PyObject* PyList_GetItem(PyObject*,Py_ssize_t pos)
+
+    cdef PyObject* PyObject_Type(PyObject*ob)
+    cdef int PyGen_Check(PyObject* ob)
+    ctypedef struct PyGenObject:
+        PyFrameObject *gi_frame
+
+cdef PyObject* ResumableExceptionClass
+
+ResumableExceptionClass=<PyObject*>PyErr_NewException("unthrow.ResumableException",NULL,NULL)
+ResumableException=<object>ResumableExceptionClass
+
+cdef _get_stack_pos(object code,int target,int before):
+    if target<0: # start of fn, empty stack
+        return 0
     cdef int no_jump
     cdef int yes_jump
     cdef int opcode
@@ -69,27 +150,47 @@ cdef get_stack_pos_after(object code,int target):
         if offset in jump_levels:
             cur_stack=jump_levels[offset]
         no_jump=PyCompile_OpcodeStackEffectWithJump(opcode,arg,0)
-#dis.stack_effect(opcode,arg,jump=False)        
         if opcode in dis.hasjabs or opcode in dis.hasjrel:
             # a jump - mark the stack level at jump target
             yes_jump=PyCompile_OpcodeStackEffectWithJump(opcode,arg,1)
-#            yes_jump=dis.stack_effect(opcode,arg,jump=True)        
             if not argval in jump_levels:
                 jump_levels[argval]=cur_stack+yes_jump
+        if before==1:
+            stack_levels[offset]=cur_stack
         cur_stack+=no_jump
-        stack_levels[offset]=cur_stack
-      #  print(offset,i.opname,argval,cur_stack)
+        if before==0:
+            stack_levels[offset]=cur_stack
+#        print(target,offset,i.opname,argval,cur_stack)
+#    print(stack_levels[target])
     return stack_levels[target]
+    
+cdef get_stack_pos_before(object code,int target):
+    return _get_stack_pos(code,target,1)
 
+cdef get_stack_pos_after(object code,int target):
+    return _get_stack_pos(code,target,0)
 
-cdef object save_frame(PyFrameObject* source_frame):
+cdef object save_frame(PyFrameObject* source_frame,from_interrupt):
     cdef PyObject *localPtr;
-    PyFrame_FastToLocals(source_frame)
+    PyFrame_LocalsToFast(source_frame,0)
+#    PyFrame_FastToLocals(source_frame)
     blockstack=[]
     # last instruction called
     lasti=source_frame.f_lasti
     # get our value stack size from the code instructions
-    our_stacksize=get_stack_pos_after(<object>source_frame.f_code,lasti-2)
+    if from_interrupt:
+        # in an interrupt top level frame, the function is at the start of an instruction
+        # and the next instruction is about to run
+        lasti-=2
+        our_stacksize=get_stack_pos_before(<object>source_frame.f_code,lasti+2)
+
+    else:
+        # anywhere else, the frame is half way through a call and lasti points
+        # at just the call. But we still have the call args pushed on stack, 
+        # lasti = lasti-2 to make the next thing be the call again 
+        # i.e. we want to run this instruction twice
+        lasti-=2
+        our_stacksize=get_stack_pos_before(<object>source_frame.f_code,lasti+2)
     our_localsize=<int>(source_frame.f_valuestack-source_frame.f_localsplus);
     code_obj=(<object>source_frame).f_code.co_code    
     # grab everything off the locals and value stack
@@ -98,92 +199,257 @@ cdef object save_frame(PyFrameObject* source_frame):
         if <int>source_frame.f_localsplus[c] ==0:
             valuestack.append(_PythonNULL())
         else:
-            valuestack.append(<object>source_frame.f_localsplus[c])
+            localObj=<object>source_frame.f_localsplus[c]
+            valuestack.append(localObj)
     blockstack=[]
     for c in range(source_frame.f_iblock):
         blockstack.append(source_frame.f_blockstack[c])
-    locals_map={}
-    if source_frame.f_locals!=source_frame.f_globals:
-        locals_map=(<object>source_frame).f_locals
-    return _SavedFrame(locals_and_stack=valuestack,code=code_obj,lasti=lasti,block_stack=blockstack,locals_map=locals_map)
+    globals_if_different=None
+    # if we are in a module (or a weird exec call)
+    # then save module level globals also
+    # n.b. this is a shallow copy, so it probably will only work nicely
+    # within the same interpreter - I don't think it is going to be 
+    # persistible
+    if source_frame.f_back!=NULL and source_frame.f_back.f_globals != source_frame.f_globals:
+        globals_if_different=(<object>source_frame).f_globals.copy()
+        # don't save the builtins dict
+        if "__builtins__" in globals_if_different:
+            del globals_if_different["__builtins__"]
+    return _SavedFrame(locals_and_stack=valuestack,code=code_obj,lasti=lasti,block_stack=blockstack,globals_if_different=globals_if_different)
 
 cdef void restore_saved_frame(PyFrameObject* target_frame,saved_frame: _SavedFrame):
-    # last instruction    
+    cdef PyObject* tmpObject
+    cdef PyObject* borrowed_list_item;
+
+    PyFrame_LocalsToFast(target_frame,1)
+    # last instruction        
     target_frame.f_lasti=saved_frame.lasti
     # check code is the same
     if (<object>target_frame).f_code.co_code!=saved_frame.code:
         print("Trying to restore wrong frame")
         return
     # restore locals and stack
-    for c,x in enumerate(saved_frame.locals_and_stack):
-        if type(x)==_PythonNULL:
+    # n.b. we currently know we're at the start of the stack, but we do need
+    # to free any locals that are currently non-null
+    num_locals=<int>(target_frame.f_valuestack-target_frame.f_localsplus)
+    num_oldstack=<int>(target_frame.f_stacktop-target_frame.f_valuestack)
+    for c in range(len(saved_frame.locals_and_stack)):
+        if c<num_locals:
+            tmpObject=target_frame.f_localsplus[c]
+        else:
+            tmpObject=NULL
+        borrowed_list_item=PyList_GetItem(<PyObject*>saved_frame.locals_and_stack,c)
+        if PyObject_Type(borrowed_list_item)==<PyObject*>_PythonNULL:
             target_frame.f_localsplus[c]=NULL
         else:
-            target_frame.f_localsplus[c]=<PyObject*>x
-            Py_INCREF(x)
-    target_frame.f_stacktop=&target_frame.f_localsplus[len(saved_frame.locals_and_stack)]
+            target_frame.f_localsplus[c]=borrowed_list_item
+            Py_XINCREF(target_frame.f_localsplus[c])
+        if tmpObject!=NULL:
+            Py_XDECREF(tmpObject)
 
+    target_frame.f_stacktop=&target_frame.f_localsplus[len(saved_frame.locals_and_stack)]
+    saved_frame.locals_and_stack=[]
     # restore block stack
     for c,x in enumerate(saved_frame.block_stack):
         target_frame.f_blockstack[c]=x
     target_frame.f_iblock=len(saved_frame.block_stack)
-    # restore local symbols
-    target_frame.f_locals=<PyObject*>(saved_frame.locals_map)
-    Py_XINCREF(target_frame.f_locals)
+    saved_frame.block_stack=[]
+    # if globals are different (i.e. in a module), then restore them
+
+    cdef PyObject *key
+    cdef PyObject *srcValue
+    cdef PyObject *targetValue
+    cdef Py_ssize_t pos = 0
+
+    if saved_frame.globals_if_different!=None:
+        while PyDict_Next(<PyObject*>(saved_frame.globals_if_different), &pos, &key, &srcValue)!=0:
+            targetValue=PyDict_GetItem(target_frame.f_globals,key)
+            # add any new keys
+            set_it=False
+            if targetValue==NULL:
+                set_it=True
+            elif targetValue!=srcValue:
+                # if they point to a different object set it
+                set_it=True
+            if set_it:
+                #print("RESTORING:",<object>key,<object>srcValue)
+                PyDict_SetItem(target_frame.f_globals,key,srcValue)
+    saved_frame.globals_if_different=None
+    del saved_frame
 
 
-class ResumableException(Exception):
-    def __init__(self,parameter):
-        Exception.__init__(self,str(parameter))
-        # store locals and stack for all the things, while we're still in a call, before exception is thrown 
-        # and calling stack objects are dereferenced
-        self._save_stack()
-        self.parameter=parameter
+# the parent frame where interrupts were started. 
+# if this is not in the call stack then we don't throw an exception
+cdef int interrupts_enabled=1
+cdef int interrupt_counter=0
+cdef int interrupt_frequency=0 # every N instructions call out to JS
+cdef int in_resume=0
+cdef int interrupt_call_level=0
+cdef int interrupt_with_level=-1
 
-
-    def _save_stack(self):
-        self.savedFrames=[]
-        st=inspect.stack()
-        for frameinfo in st:
-            self.savedFrames.append(save_frame(<PyFrameObject*>(frameinfo.frame)))
-
-    def resume(self):
-        global __skip_stop
-        __skip_stop=True
-        st=inspect.stack()
-        for frameinfo in reversed(st):
-            if self.savedFrames[-1].code==frameinfo.frame.f_code.co_code:
-                self.savedFrames=self.savedFrames[:-1]
-        sys.settrace(self._calltrace)
-
-    def _calltrace(self,frame,event,arg):
-        if len(self.savedFrames)>0:
-            return self._resumefn
-        return None
-
-    def _resumefn(self,frame,event,arg):
-        if len(self.savedFrames)>0:
-            resumeFrame=self.savedFrames[-1]
-            if frame.f_code.co_code==resumeFrame.code:
-#                print("MATCH FRAME:",frame,resumeFrame)
-                self.savedFrames=self.savedFrames[:-1]
-                restore_saved_frame(<PyFrameObject*>frame,resumeFrame)
-                if len(self.savedFrames)==0:
-                    sys.settrace(None)
-
-# this is a c function so it doesn't get traced into
-def stop(msg):
-    global __skip_stop
-    if __skip_stop:
-#        print("RESUMING")
-        __skip_stop=False
+cdef void set_resume(PyObject* obj,int is_resuming):
+    global in_resume,resume_state,interrupt_frequency
+    resume_state=0
+    in_resume=is_resuming
+    if in_resume==0 and interrupt_frequency==0:
+        PyEval_SetTrace(NULL,NULL)
     else:
-#        print("STOPPING NOW")
-        rex=ResumableException(msg)
-        raise rex
+        PyEval_SetTrace(&_c_trace_fn,obj)
+
+cdef void set_interrupt_frequency(PyObject* obj,int freq):
+    global in_resume,resume_state,interrupt_frequency,interrupt_counter
+    if interrupt_frequency!=freq:
+        interrupt_counter=0
+        interrupt_frequency=freq
+        if in_resume==0 and interrupt_frequency==0:
+            PyEval_SetTrace(NULL,NULL)
+        else:
+            PyEval_SetTrace(&_c_trace_fn,obj)
+
+cdef int _c_trace_fn(PyObject *self, PyFrameObject *frame,
+                 int what, PyObject *arg):
+    global interrupt_frequency,interrupt_counter,interrupts_enabled,interrupt_call_level,interrupt_with_level
+    if in_resume:
+        # in resume call, ignore interrupts
+        if what==PyTrace_CALL:
+            (<object>self)._resumefn(<object>frame)
+    elif interrupts_enabled==1:
+        if what==PyTrace_CALL:
+            interrupt_call_level+=1
+        if what==PyTrace_RETURN:
+            interrupt_call_level-=1
+            if interrupt_call_level<0:
+                # outside the scope where we were called, stop tracing now
+                set_interrupt_frequency(<PyObject*>_trace_obj,0)
+        if interrupt_frequency!=0 and what==PyTrace_LINE:
+            # on a line
+            # check if we are have a finally block at this level (either a with block or a try,except,finally
+            # we can't resume within those or bad things will happen
+            if interrupt_with_level==-1 or interrupt_with_level>=interrupt_call_level:
+                interrupt_with_level=-1
+                for c in range(frame.f_iblock):
+                    if (frame.f_blockstack[c].b_type)==SETUP_FINALLY: # with block is basically try, finally
+                        interrupt_with_level=interrupt_call_level                
+            interrupt_counter+=1
+            interrupts_enabled=0 
+            # only throw interrupt if we are not inside a with block, 
+            # as we can't restore context managers (files etc)
+            if interrupt_counter>=interrupt_frequency and interrupt_with_level==-1:
+                # throw interrupt exception
+                interrupt_counter=0
+                make_interrupt(<void*>self,frame)
+                return 1 # need to return 1 to signal error or else our exception 
+                         # gets cleaned up by cpython
+            else:
+                interrupts_enabled=1
+#    if traceall and what==PyTrace_CALL:
+#        print("Making call",interrupt_call_level)
+    return 0
+
+cdef make_interrupt(void* arg,PyFrameObject*frame):    
+    interrupts_enabled=0
+    cdef PyObject *rex
+    cdef PyObject* rex_type
+    cdef char*str="interrupt"
+    cdef PyObject* msg=PyDict_New()
+    PyDict_SetItemString(msg,"interrupt",Py_True)
+    try:
+        rex=make_resumable_exception(msg,frame)
+        rex_type=<PyObject*>rex.ob_type
+        PyErr_SetObject(<PyObject*>rex_type,rex)
+        Py_XDECREF(rex)
+    except Exception as err:
+        print("PROBLEM IN CONSTRUCT REX",err)
+    return 0
+
+
+cdef PyObject* make_resumable_exception(PyObject* msg,PyFrameObject* frame):
+    cdef PyObject* exc=PyObject_Call(ResumableExceptionClass,PyTuple_New(0),NULL)
+    (<object>exc).parameter=<object>msg;
+    (<object>exc).saved_frames=[]
+    save_stack((<object>exc).saved_frames,frame)
+    return exc
 
     
 
+# store locals and stack for all the things, while we're still in a call, before exception is thrown 
+# and calling stack objects are dereferenced etc.
+cdef save_stack(object saved_frames,PyFrameObject* cFrame):
+    from_interrupt=False
+    if cFrame==NULL:
+        cFrame=PyEval_GetFrame()
+    else:
+        from_interrupt=True
+    while cFrame!=NULL:
+        saved_frames.append(save_frame(cFrame,from_interrupt=from_interrupt))
+        from_interrupt=False # only the top frame of an interrupt is different
+        cFrame=cFrame.f_back
 
+cpdef void resume(object saved_frames):
+    global __skip_stop
+    cdef PyFrameObject* cFrame;
+    cFrame=PyEval_GetFrame()
+    allStack=[]
+    while cFrame!=NULL:
+        allStack.append(<object>cFrame)
+        cFrame=cFrame.f_back
+    for frame in reversed(allStack):
+        if saved_frames[-1].code==frame.f_code.co_code:
+            #print("REMOVING",frame.f_code.co_code,self.saved_frames[-1])
+            saved_frames.pop()
+    allStack=[]
+    _trace_obj.set_resume_obj(saved_frames)
+    set_resume(<PyObject*>_trace_obj,1)
+
+cdef void _resume(PyObject* c_saved_frames,PyFrameObject* c_frame):
+    global interrupts_enabled
+    frame=<object>c_frame
+    saved_frames=<object>c_saved_frames
+    if len(saved_frames)>0:
+        resumeFrame=saved_frames[-1]
+        if frame.f_code.co_code==resumeFrame.code:
+            saved_frames.pop()
+            #print("MATCH FRAME:",frame,resumeFrame)
+            restore_saved_frame(c_frame,resumeFrame)
+            if len(saved_frames)==0:
+                set_resume(<PyObject*>_trace_obj,0)
+                _trace_obj.set_resume_obj(None)
+                interrupts_enabled=1
+
+# this is a c function so it doesn't get traced into
+def stop(msg):
+    global __skip_stop,interrupts_enabled
+    if __skip_stop:
+        #print("RESUMING - enable interrupts")
+        __skip_stop=False
+        interrupts_enabled=1
+    else:
+        __skip_stop=True
+        # disable interrupts until we return from this
+        interrupts_enabled=0
+        #print("STOPPING NOW - disabled interrupts",<object>msg)
+        rex=make_resumable_exception(<PyObject*>msg,NULL)
+        objRex=<object>rex
+        Py_XDECREF(rex)
+        raise objRex
+
+def set_interrupts(freq):
+    # get the interrupt top frame, we only throw interrupts below here
+    # otherwise weird stuff happens with things like stdout
+    set_interrupt_frequency(<PyObject*>_trace_obj,freq)
+    interrupt_call_level=0
+
+
+class _Tracer:
+    def __init__(self):
+        self.resumeObj=None
+
+    def set_resume_obj(self,obj):
+        self.resumeObj=obj
+
+    def _resumefn(self,frame): 
+        _resume(<PyObject*>self.resumeObj,<PyFrameObject*>frame)
+
+_trace_obj=_Tracer()
 
 
