@@ -18,6 +18,12 @@ class Resumer:
         self.freq=0
         self.running=0
 
+    def cancel(self):
+        global __skip_stop
+        self.resume_stack=None
+        __skip_stop=False
+        set_resume(0)
+
     def run_once(self,mainfn,args):
         global interrupts_enabled
         if self.resume_stack:
