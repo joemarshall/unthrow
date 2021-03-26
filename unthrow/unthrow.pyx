@@ -134,12 +134,14 @@ cdef extern from "Python.h":
     ctypedef struct PyCodeObject:
         PyObject* co_code
         PyObject* co_name
+        PyObject* co_filename
         
     cdef PyObject* Py_True
     ctypedef int (*Py_tracefunc)(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg)
     cdef enum _trace_types:
         PyTrace_LINE
         PyTrace_CALL
+        PyTrace_C_CALL
         PyTrace_OPCODE
         PyTrace_RETURN
 
@@ -372,7 +374,12 @@ cdef int _c_trace_fn(PyObject *self, PyFrameObject *frame,
         if what==PyTrace_CALL:
             # check if this call is enter or exit of a with
             if <object>(frame.f_code.co_name)=="__enter__" or <object>(frame.f_code.co_name)=="__exit__":
-                interrupt_with_level=interrupt_call_level
+                if interrupt_with_level==-1:
+                    interrupt_with_level=interrupt_call_level
+            # and don't interrupt in import machinery
+            elif (<object>(frame.f_code.co_filename)).find("importlib.")!=-1:
+                if interrupt_with_level==-1:
+                    interrupt_with_level=interrupt_call_level
             interrupt_call_level+=1
         if what==PyTrace_RETURN:
             interrupt_call_level-=1
