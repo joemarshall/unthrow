@@ -79,7 +79,7 @@ x=["woo"]
 r=unthrow.Resumer()
 r.set_interrupt_frequency(2)
 while r.finished==False:
-    print("TP",end="")
+    print("@",end="")
     r.run_once(mainApp,x)
 print("Doing something outside everything")
 for c in range(100):

@@ -61,7 +61,7 @@ class Resumer:
 
 # like a named tuple but mutable (so that we can zero things to avoid leaks)
 class _SavedFrame:
-    def __init__(self,*,locals_and_stack,lasti,code,block_stack,globals_if_different):
+    def __init__(self,*,locals_and_stack,lasti,code,block_stack,globals_if_different,slow_locals):
         dict=locals().copy() # put all the parameters to this into the dict
         del dict["self"]
         self._dictionary=dict
@@ -135,6 +135,7 @@ cdef extern from "Python.h":
         PyObject* co_code
         PyObject* co_name
         PyObject* co_filename
+        int co_flags
         
     cdef PyObject* Py_True
     ctypedef int (*Py_tracefunc)(PyObject *obj, PyFrameObject *frame, int what, PyObject *arg)
@@ -224,10 +225,21 @@ cdef get_stack_pos_before(object code,int target):
 cdef get_stack_pos_after(object code,int target):
     return _get_stack_pos(code,target,0)
 
+cdef get_line_start(object code,int target):
+    lineStart=target
+    for i in dis.get_instructions(code):
+        if i.offset>=target:
+            break
+        if i.starts_line:
+            lineStart=i.offset
+#    print("Line start for ",target,"=",lineStart,end="")
+#    dis.dis(code)
+    return lineStart
+
 cdef object save_frame(PyFrameObject* source_frame,from_interrupt):
     cdef PyObject *localPtr;
-    PyFrame_LocalsToFast(source_frame,0)
-#    PyFrame_FastToLocals(source_frame)
+    if (source_frame.f_code.co_flags & inspect.CO_OPTIMIZED)!=0:
+        PyFrame_LocalsToFast(source_frame,0)
     blockstack=[]
     # last instruction called
     lasti=source_frame.f_lasti
@@ -245,6 +257,7 @@ cdef object save_frame(PyFrameObject* source_frame,from_interrupt):
         # at just the call. But we still have the call args pushed on stack, 
         # lasti = lasti-2 to make the next thing be the call again 
         # i.e. we want to run this instruction twice
+        lasti=get_line_start(<object>source_frame.f_code,lasti)
         lasti-=2
         our_stacksize=get_stack_pos_before(<object>source_frame.f_code,lasti+2)
     our_localsize=<int>(source_frame.f_valuestack-source_frame.f_localsplus);
@@ -271,13 +284,19 @@ cdef object save_frame(PyFrameObject* source_frame,from_interrupt):
         # don't save the builtins dict
         if "__builtins__" in globals_if_different:
             del globals_if_different["__builtins__"]
-    return _SavedFrame(locals_and_stack=valuestack,code=code_obj,lasti=lasti,block_stack=blockstack,globals_if_different=globals_if_different)
+
+    # if we are in a non-optimized frame, i.e. without fast locals, we need to copy the locals dict
+    slow_locals=None
+    if (source_frame.f_code.co_flags & inspect.CO_OPTIMIZED)==0 and source_frame.f_locals!=source_frame.f_globals:
+        slow_locals=(<object>source_frame).f_locals.copy()
+
+    return _SavedFrame(locals_and_stack=valuestack,code=code_obj,lasti=lasti,block_stack=blockstack,globals_if_different=globals_if_different,slow_locals=slow_locals)
 
 cdef void restore_saved_frame(PyFrameObject* target_frame,saved_frame: _SavedFrame):
     cdef PyObject* tmpObject
     cdef PyObject* borrowed_list_item;
-
-    PyFrame_LocalsToFast(target_frame,1)
+    if (target_frame.f_code.co_flags & inspect.CO_OPTIMIZED)!=0:
+        PyFrame_LocalsToFast(target_frame,1)
     # last instruction        
     target_frame.f_lasti=saved_frame.lasti
     # check code is the same
@@ -302,6 +321,8 @@ cdef void restore_saved_frame(PyFrameObject* target_frame,saved_frame: _SavedFra
             Py_XINCREF(target_frame.f_localsplus[c])
         if tmpObject!=NULL:
             Py_XDECREF(tmpObject)
+
+        
 
     target_frame.f_stacktop=&target_frame.f_localsplus[len(saved_frame.locals_and_stack)]
     saved_frame.locals_and_stack=[]
@@ -331,6 +352,21 @@ cdef void restore_saved_frame(PyFrameObject* target_frame,saved_frame: _SavedFra
                 #print("RESTORING:",<object>key,<object>srcValue)
                 PyDict_SetItem(target_frame.f_globals,key,srcValue)
     saved_frame.globals_if_different=None
+
+    if (target_frame.f_code.co_flags & inspect.CO_OPTIMIZED)==0 and saved_frame.slow_locals!=None:
+        while PyDict_Next(<PyObject*>(saved_frame.slow_locals), &pos, &key, &srcValue)!=0:
+            targetValue=PyDict_GetItem(target_frame.f_locals,key)
+            # add any new keys
+            set_it=False
+            if targetValue==NULL:
+                set_it=True
+            elif targetValue!=srcValue:
+                # if they point to a different object set it
+                set_it=True
+            if set_it:
+                #print("RESTORING:",<object>key,<object>srcValue)
+                PyDict_SetItem(target_frame.f_locals,key,srcValue)
+    saved_frame.slow_locals=None
     del saved_frame
 
 
