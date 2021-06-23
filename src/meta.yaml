@@ -1,0 +1,5 @@
+package:
+  name: unthrow
+  version: "0.1"
+source:
+  path: ./src
