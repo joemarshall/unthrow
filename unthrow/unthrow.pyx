@@ -10,6 +10,8 @@ import sys,inspect,dis
 
 traceall=False
 
+DEF PythonVersion=3.9
+
 class Resumer:
     def __init__(self):
         self.finished=False
@@ -126,9 +128,19 @@ cdef extern from "frameobject.h":
 
 
 cdef extern from "opcode.h":
-    cdef enum _opcodes:
-        SETUP_FINALLY
-        BEGIN_FINALLY
+    IF PythonVersion==3.8:
+        cdef enum _opcodes:
+            SETUP_FINALLY
+            BEGIN_FINALLY        
+    ELSE:
+        # 3.9 or newer
+        cdef enum _opcodes:
+            SETUP_FINALLY
+            DUP_TOP
+            POP_TOP
+            SETUP_WITH
+            SETUP_ASYNC_WITH
+        
 
 cdef extern from "Python.h":
     ctypedef struct PyCodeObject:
@@ -399,6 +411,32 @@ cdef void set_interrupt_frequency(int freq):
         else:
             PyEval_SetTrace(&_c_trace_fn,NULL)
 
+# check if this frame is currently within a with or finally block
+cdef int _check_blocks(PyFrameObject* frame):
+    frameCode=PyBytes_AsString(frame.f_code.co_code)
+    for c in range(frame.f_iblock):
+        # inside a with block
+        if frame.f_blockstack[c].b_type==SETUP_WITH or frame.f_blockstack[c].b_type==SETUP_ASYNC_WITH:
+            return True
+        # inside a block which is a try, finally block
+        if (frame.f_blockstack[c].b_type)==SETUP_FINALLY: # with block is basically try, finally
+            # SETUP_FINALLY also sets up exception catches, an actual finally block
+            # on 3.8 
+            # is a SETUP_FINALLY that points to POP_BLOCK, BEGIN_FINALLY
+            # on 3.9 it is a setupfinally that points to 
+            # something other than DUP_TOP or POP_TOP
+            # we only care about exception blocks that would be called when our exception 
+            # comes out. nb. catch-all exception blocks will also get called
+# 3.8 code
+#                                if frameCode[frame.f_blockstack[c].b_handler-2]==BEGIN_FINALLY:
+#                                   # there is a finally block
+#                                    interrupt_with_level=interrupt_call_level
+            if frameCode[frame.f_blockstack[c].b_handler]!=DUP_TOP and frameCode[frame.f_blockstack[c].b_handler]!=POP_TOP:
+               # there is a finally block
+                return True
+            else:
+                return False
+
 cdef int _c_trace_fn(PyObject *self, PyFrameObject *frame,
                  int what, PyObject *arg):
     global interrupt_frequency,interrupt_counter,interrupts_enabled,interrupt_call_level,interrupt_with_level
@@ -416,8 +454,14 @@ cdef int _c_trace_fn(PyObject *self, PyFrameObject *frame,
             elif (<object>(frame.f_code.co_filename)).find("importlib.")!=-1:
                 if interrupt_with_level==-1:
                     interrupt_with_level=interrupt_call_level
+            # and check if the parent is within a finally block etc.
+            elif interrupt_call_level!=-1 and _check_blocks(frame.f_back):
+                if interrupt_with_level==-1:
+                    interrupt_with_level=interrupt_call_level
             interrupt_call_level+=1
         if what==PyTrace_RETURN:
+            if interrupt_call_level<interrupt_with_level:
+                interrupt_with_level=-1
             interrupt_call_level-=1
             if interrupt_call_level<0:
                 # outside the scope where we were called, stop tracing now
@@ -427,24 +471,12 @@ cdef int _c_trace_fn(PyObject *self, PyFrameObject *frame,
             # only throw interrupt if we are not inside a with block, 
             # as we can't restore context managers (files etc)
             if interrupt_counter>=interrupt_frequency:
-                # check if we are have a finally block at this level (either a with block or a try,except,finally
-                # we can't resume within those or bad things will happen
+                # check that this frames isn't within a with or finally block
+                # (parent frames are checked on call)
                 if interrupt_with_level==-1 or interrupt_with_level>=interrupt_call_level:
                     interrupt_with_level=-1
-                    for c in range(frame.f_iblock):
-                        # we expect to be inside our own with block at level zero
-                        if interrupt_call_level==0 and c<=interrupt_with_block_initial_level:
-                            continue
-                        if (frame.f_blockstack[c].b_type)==SETUP_FINALLY: # with block is basically try, finally
-                            # SETUP_FINALLY also sets up exception catches, an actual finally block
-                            # is a SETUP_FINALLY that points to POP_BLOCK, BEGIN_FINALLY
-                            # we only care about exception blocks that would be called when our exception 
-                            # comes out. nb. catch-all exception blocks will also get called
-                            frameCode=PyBytes_AsString(frame.f_code.co_code)
-                            if frameCode[frame.f_blockstack[c].b_handler-2]==BEGIN_FINALLY:
-                               # there is a finally block
-                               interrupt_with_level=interrupt_call_level
-
+                    if _check_blocks(frame):
+                      interrupt_with_level=interrupt_call_level
                 interrupts_enabled=0 
                 if interrupt_with_level==-1:
                     # throw interrupt exception
